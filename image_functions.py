@@ -323,10 +323,10 @@ class image_sampler:
             img (Array): RGB input image
             num_particles (int, optional): Number of particles in sample. Should be comparable in magnitude to the number of pixels in the image. Defaults to 15000.
             loss_space (Literal[&#39;rgb&#39;, &#39;oklab&#39;], optional): Color space to calculate loss function. Defaults to "rgb".
-            likelihood_params (_type_, optional): Parameters for likelihood function. Defaults to {"dist_mod": lambda x: (9 * x) ** 2}.
-            posterization_params (_type_, optional): Parameters for posterization function. Defaults to {"posterizer": "rgb", "n_colors": 9}.
-            smoother_params (_type_, optional): Parameters for smoothing function. Defaults to {"kernel_size":9, "kernel_std": 1.0}.
-            sampler_params (_type_, optional): Parameters for sampling function. Defaults to { "annealing_steps": 125, "lambd_range": (-3, -0.5), "extra_steps": 25, }.
+            likelihood_params (dict, optional): Parameters for likelihood function. Defaults to {"dist_mod": lambda x: (9 * x) ** 2}.
+            posterization_params (dict, optional): Parameters for posterization function. Defaults to {"posterizer": "rgb", "n_colors": 9}.
+            smoother_params (dict, optional): Parameters for smoothing function. Defaults to {"kernel_size":9, "kernel_std": 1.0}.
+            sampler_params (dict, optional): Parameters for sampling function. Defaults to { "annealing_steps": 125, "lambd_range": (-3, -0.5), "extra_steps": 25, }.
         """
         self.img = img
         self.num_particles = num_particles
@@ -364,9 +364,8 @@ class image_sampler:
         )  # initialize particles
         # create reference image for loss function
         self.ref_img = gaussian_smooth(image=self.palette, **self.smoother_params)
-        self._gen_likelihood_function(
-            **self.likelihood_params
-        )  # create loss function from reference image
+        # create loss function from reference image
+        self._log_likelihood = self._gen_likelihood_function(**self.likelihood_params)  
         frames = self._sample_tempered_hmc(z_init, key3)[0]  # samples particle movement
         # convert to RGB if working in OKLAB space
         if self.loss_space.lower() == "oklab":
@@ -436,7 +435,7 @@ class image_sampler:
             )
             return value
 
-        self._log_likelihood = log_likelihood
+        return log_likelihood
 
     def _sample_tempered_hmc(self, init, key):
         samp_params = self.sampler_params.copy()
@@ -495,7 +494,7 @@ class image_sampler:
         return smc_samples
 
     def show_loss_map(self):
-        """Prints a heatmap of the loss function for each color in the palette. Must be run after `run`. Useful for debugging."""
+        """Prints a heatmap of the negative loglikelihood function for each color. Must be run after `run`. Useful for debugging."""
         # get unique color values
         colors = self.palette
         colors = jnp.reshape(colors, (-1, 3))
@@ -521,23 +520,55 @@ class image_sampler:
 
         # plot
         for i, loss_map in enumerate(loss_maps):
-            pic = ax[i].imshow(-loss_map, cmap="grey", aspect="auto")
+            pic = ax[i].imshow(-1*loss_map, cmap="grey", aspect="auto")
         fig.colorbar(pic, ax=axes, orientation="horizontal", fraction=0.05, pad=0.1)
         plt.show()
+    def _reshape_frames(self, smoothing_params:dict=None)->Array:
+        """Reorganizes random particle samples into a sequence of images.
 
-    def draw_gif(self, gif_loc: str = None, interval: int = 50) -> FuncAnimation:
+        Args:
+            smoothing_params (dict, optional): Smoothing parameters to apply to each image. Defaults to None.
+
+        Returns:
+            Array: Array of images.
+        """
+        n, _, _ = self.frames.shape
+        output_array = jnp.ones((n, self.xmax, self.ymax, 3))
+        
+        # Iterate over the batch dimension
+        for i in range(n):
+            indices = self.frames[i, :, :2].astype(int)
+            values = self.frames[i, :, 2:]
+            output_array = output_array.at[i, indices[:, 0], indices[:, 1]].set(values)
+            if smoothing_params:
+                in_oklab = vmap(vmap(linear_srgb_to_oklab))(output_array[i])
+                smoothed_oklab = gaussian_smooth(in_oklab, **smoothing_params)
+                smoothed_rgb = jnp.clip (vmap(vmap(oklab_to_linear_srgb))(smoothed_oklab) , 0., 1.)
+                output_array = output_array.at[i].set(smoothed_rgb)
+        return output_array
+
+    def draw_gif(self, gif_loc: str = None, interval: int = 50, render:Literal['scatter', 'pixel']='pixel', smoothing_params:dict=None) -> FuncAnimation:
         """Creates GIF from samples stored in class object. Must be run after `self.run`.
 
         Args:
             gif_loc (str, optional): File location to save GIF. Does not save if None. Defaults to None.
             interval (int, optional): Delay in ms between frames. Defaults to 50.
-
+            render (Literal[&#39;scatter&#39;, &#39;img&#39;], optional): Method to render images. Defaults to 'pixel'.
+            smoothing_params (dict, optional): `gaussian_filter` params to apply to frames of GIF if `render='pixel'`. Defaults to None.
+        
         Returns:
             FuncAnimation: Matplotlib FuncAnimation object
         """
+        
         fig, ax = plt.subplots()
         # initialize plot with noisy data
-        scatter = ax.scatter(self.frames[0][:, 1], self.frames[0][:, 0])
+        if render=='scatter':
+            scatter = ax.scatter(self.frames[0][:, 1], self.frames[0][:, 0])
+            frames = self.frames
+
+        else:
+            img = ax.imshow(np.ones_like(self.img))
+            frames = self._reshape_frames(smoothing_params)
 
         # params dump to prevent axes, any whitespace
         # some is probabily un-necessary, but it works
@@ -550,19 +581,23 @@ class image_sampler:
         ax.set_ylim(0, self.xmax)
 
         def update(frame_data):
-            offsets = np.column_stack(
-                (frame_data[:, 1], self.xmax - frame_data[:, 0])
-            )  # it otherwise prints upside down
-            colors = frame_data[:, 2:]
-            scatter.set_offsets(offsets)
-            scatter.set_color(np.array(colors))
-            scatter.set_sizes(np.pi * np.ones(frame_data.shape[0]))
-            return (scatter,)
+            if render == 'scatter':
+                offsets = np.column_stack(
+                    (frame_data[:, 1], self.xmax - frame_data[:, 0])
+                )  # it otherwise prints upside down
+                colors = frame_data[:, 2:]
+                scatter.set_offsets(offsets)
+                scatter.set_color(np.array(colors))
+                scatter.set_sizes(np.pi * np.ones(frame_data.shape[0]))
+                return (scatter,)
+            else:
+                img.set_data(jnp.flip(frame_data, axis=0))
+                return (img,)
 
         ani = FuncAnimation(
             fig,
             update,
-            frames=self.frames,
+            frames=frames,
             blit=True,
             interval=interval,
         )
