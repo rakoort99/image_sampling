@@ -523,22 +523,23 @@ class image_sampler:
             pic = ax[i].imshow(-1*loss_map, cmap="grey", aspect="auto")
         fig.colorbar(pic, ax=axes, orientation="horizontal", fraction=0.05, pad=0.1)
         plt.show()
-    def _reshape_frames(self, smoothing_params:dict=None)->Array:
+    def _reshape_frames(self, frames:Array, smoothing_params:dict=None)->Array:
         """Reorganizes random particle samples into a sequence of images.
 
         Args:
+            frames (Array): Sample frames to reshape into images.
             smoothing_params (dict, optional): Smoothing parameters to apply to each image. Defaults to None.
 
         Returns:
             Array: Array of images.
         """
-        n, _, _ = self.frames.shape
+        n, _, _ = frames.shape
         output_array = jnp.ones((n, self.xmax, self.ymax, 3))
         
         # Iterate over the batch dimension
         for i in range(n):
-            indices = self.frames[i, :, :2].astype(int)
-            values = self.frames[i, :, 2:]
+            indices = frames[i, :, :2].astype(int)
+            values = frames[i, :, 2:]
             output_array = output_array.at[i, indices[:, 0], indices[:, 1]].set(values)
             if smoothing_params:
                 in_oklab = vmap(vmap(linear_srgb_to_oklab))(output_array[i])
@@ -547,11 +548,12 @@ class image_sampler:
                 output_array = output_array.at[i].set(smoothed_rgb)
         return output_array
 
-    def draw_gif(self, gif_loc: str = None, interval: int = 50, render:Literal['scatter', 'pixel']='pixel', smoothing_params:dict=None) -> FuncAnimation:
+    def draw_gif(self, gif_loc: str = None, start_frame:int=0,interval: int = 50, render:Literal['scatter', 'pixel']='pixel', smoothing_params:dict=None) -> FuncAnimation:
         """Creates GIF from samples stored in class object. Must be run after `self.run`.
 
         Args:
             gif_loc (str, optional): File location to save GIF. Does not save if None. Defaults to None.
+            start_frame (int, optional): Sample step to begin GIF on. Defaults to 0.
             interval (int, optional): Delay in ms between frames. Defaults to 50.
             render (Literal[&#39;scatter&#39;, &#39;img&#39;], optional): Method to render images. Defaults to 'pixel'.
             smoothing_params (dict, optional): `gaussian_filter` params to apply to frames of GIF if `render='pixel'`. Defaults to None.
@@ -564,14 +566,14 @@ class image_sampler:
         # initialize plot with noisy data
         if render=='scatter':
             scatter = ax.scatter(self.frames[0][:, 1], self.frames[0][:, 0])
-            frames = self.frames
+            frames = self.frames[start_frame:]
 
         else:
             img = ax.imshow(np.ones_like(self.img))
-            frames = self._reshape_frames(smoothing_params)
+            frames = self._reshape_frames(self.frames[start_frame:], smoothing_params)
 
         # params dump to prevent axes, any whitespace
-        # some is probabily un-necessary, but it works
+        # some are probabily un-necessary, but it works
         fig.set_size_inches((6 * self.ymax / self.xmax, 6), forward=True)
         ax.axis("off")
         ax.margins(0)
