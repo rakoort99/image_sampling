@@ -269,7 +269,7 @@ def posterize_image(
 
 
 def gaussian_smooth(
-    image: Array, kernel_size: int = 9, kernel_std: float = 1.0, use: bool = True
+    image: Array, kernel_size: int = 9, kernel_std: float = 1.0,
 ) -> Array:
     """Applies Gaussian smoothing to image. Pads image with edge values before convolving.
 
@@ -277,14 +277,10 @@ def gaussian_smooth(
         image (Array): Image to smooth.
         kernel_size (int, optional): Size of Gaussian kernel. Defaults to 9.
         kernel_std (float, optional): Standard deviation of Gaussian. Defaults to 1..
-        use (bool, optional): If False, returns unsmoothed image. Defaults to True.
 
     Returns:
         Array: _description_
     """
-    if not use:
-        return image
-
     # smoothing helps prevent pixels from collecting at edges
     x = jnp.linspace(-kernel_size // 2, kernel_size // 2, kernel_size)
     window = jsp.stats.norm.pdf(x, scale=kernel_std) * jsp.stats.norm.pdf(
@@ -301,19 +297,43 @@ def gaussian_smooth(
     smooth_image = jnp.stack(to_stack, -1)
     return smooth_image
 
+@jit
+def boxcox(lambd, x):
+    bc = lax.cond(
+            lambd==0.,
+            lambda x: jnp.log(x),
+            lambda x: (x**lambd - 1)/lambd,
+            operand=x,
+        )
+    return bc
+
+def opt_boxcox(x, box_bounds):
+    @jit
+    def check_bc_normality(lambd, x):
+        bc = boxcox(lambd, x)
+        mu = jnp.mean(bc)
+        sig = jnp.std(bc)
+        logpdfs = jsp.stats.norm.logpdf(bc, mu, sig)
+        return -1* jnp.sum(logpdfs)
+        
+    solver = ProjectedGradient(fun=check_bc_normality, projection=projection_box)
+    init = 0.01
+    res = solver.run(init, box_bounds, x=x)
+    lambd = res.params
+    return boxcox(lambd, x), lambd
 
 class image_sampler:
     def __init__(
         self,
         img: Array,
-        num_particles: int = 15000,
+        num_particles: int = 50000,
         loss_space: Literal["rgb", "oklab"] = "rgb",
-        likelihood_params: dict = {"dist_mod": lambda x: (9 * x) ** 2},
+        likelihood_params: dict = {"INF":1e2, 'scaled':True, 'box_bounds':(-5., 5.)},
         posterization_params: dict = {"posterizer": "rgb", "n_colors": 9},
-        smoother_params: dict = {"kernel_size": 9, "kernel_std": 1.0},
+        smoother_params: dict = {"kernel_size": 1, "kernel_std": 1.},
         sampler_params: dict = {
-            "annealing_steps": 125,
-            "lambd_range": (-3, -0.5),
+            "annealing_steps": 50,
+            "lambd_range": (-1., 2.),
             "extra_steps": 25,
         },
     ):
@@ -408,12 +428,11 @@ class image_sampler:
         z_init = jnp.concat([coords_init, colors], axis=-1)
         return z_init
 
-    def _gen_likelihood_function(self, dist_mod=lambda x: x, INF=1e2):
+    def _gen_likelihood_function(self, INF=1e2, scaled=True, box_bounds=(-5.,5.)):
         @jit
         def log_likelihood(z):
             def distance(x, y):
                 return jnp.sqrt(jnp.sum((x - y) ** 2))
-
             coords = z[:2]
             colors = z[2:]
             floor_z = jnp.floor(coords)
@@ -430,18 +449,56 @@ class image_sampler:
                 out_of_bounds,
                 lambda *_: -INF,
                 lambda arg: -1
-                * dist_mod(distance(self.ref_img[arg[0], arg[1]], colors)),
+                * distance(self.ref_img[arg[0], arg[1]], colors),
                 operand=floor_z,
             )
             return value
+        
+        if scaled:
+            loss_maps, (uq_colors, invs) = self._gen_loss_maps(log_likelihood)
+            mins = jnp.min( loss_maps, axis=(1,2))
+            offset = 1.1
+            bcd, lambds = vmap(lambda x, mins, offset: opt_boxcox(x - mins + offset, box_bounds), 
+                               (0,0,None))(loss_maps, mins, offset)
+            loss_maps = bcd          
+            means = jnp.mean(bcd, axis=(1,2))
+            stds = jnp.std(bcd, axis=(1,2))
+            def find_index(value):
+                match = jnp.all(uq_colors == value, axis=1)
+                return jnp.argmax(match)
+            @jit
+            def log_likelihood(z):
+                def distance(x, y):
+                    return jnp.sqrt(jnp.sum((x - y) ** 2))
+                coords = z[:2]
+                colors = z[2:]
+                floor_z = jnp.floor(coords)
+                floor_z = jnp.astype(floor_z, jnp.int32)
 
+                # ensure pixel coords are inside the image
+                out_of_bounds = (
+                    (floor_z[0] < 0)
+                    | (floor_z[0] > self.xmax - 1)
+                    | (floor_z[1] < 0)
+                    | (floor_z[1] > self.ymax - 1)
+                )
+                idx = find_index(colors)
+                dist = -1*distance(self.ref_img[floor_z[0], floor_z[1]], colors)
+                bcd = boxcox(lambds[idx], dist - mins[idx]+offset)
+                value = lax.cond(
+                    out_of_bounds,
+                    lambda *_: -INF,
+                    lambda *_: (bcd - means[idx])/stds[idx],
+                    operand=floor_z,
+                )
+                return value
         return log_likelihood
 
     def _sample_tempered_hmc(self, init, key):
         samp_params = self.sampler_params.copy()
         n_samples = self.num_particles
         annealing_steps = samp_params.pop("annealing_steps", 125)
-        lambd_range = samp_params.pop("lambd_range", (-3, -0.5))
+        lambd_range = samp_params.pop("lambd_range", (-1., 2.))
         extra_steps = samp_params.pop("extra_steps", 25)
 
         key, subkey = jr.split(key)
@@ -488,17 +545,16 @@ class image_sampler:
             mode="constant",
             constant_values=(schedule[-1],),
         )
-        n_iter, smc_samples = railed_smc_inference_loop(
+        _, smc_samples = railed_smc_inference_loop(
             subkey, schedule_tempered.step, initial_smc_state, schedule
         )
         return smc_samples
 
-    def show_loss_map(self):
-        """Prints a heatmap of the negative loglikelihood function for each color. Must be run after `run`. Useful for debugging."""
+    def _gen_loss_maps(self, log_likelihood_fn):
         # get unique color values
         colors = self.palette
         colors = jnp.reshape(colors, (-1, 3))
-        colors = jnp.unique(colors, axis=0)
+        colors, invs = jnp.unique(colors, axis=0, return_inverse=True)
 
         # get coordinate array to calculate loss values at, same shape as img
         x = jnp.arange(self.xmax)
@@ -507,12 +563,19 @@ class image_sampler:
         coordinates_array = jnp.stack((xx, yy), axis=-1)
 
         # generate images
-        loss_maps = []
-        for color in colors:
+        def color2map(color):
             values = jnp.array(color).reshape(1, 1, 3)
             uniform_img = jnp.tile(values, (self.xmax, self.ymax, 1))
             loss_ready = jnp.concat([coordinates_array, uniform_img], axis=-1)
-            loss_maps.append(vmap(vmap(self._log_likelihood))(loss_ready))
+            loss_map = vmap(vmap(log_likelihood_fn))(loss_ready)
+            return loss_map
+        loss_maps = vmap(color2map)(colors)
+        return loss_maps, (colors, invs)
+
+    def show_loss_map(self):
+        """Prints a heatmap of the negative loglikelihood function for each color. Must be run after `run`. Useful for debugging."""
+        # get unique color values
+        loss_maps, (_,_) = self._gen_loss_maps(self._log_likelihood)
 
         nrowsfn = lambda x: x // 4 + 1 if x % 4 != 0 else x // 4  # noqa: E731
         fig, axes = plt.subplots(nrowsfn(len(loss_maps)), 4, sharex=True, sharey=True)
@@ -522,6 +585,9 @@ class image_sampler:
         for i, loss_map in enumerate(loss_maps):
             pic = ax[i].imshow(-1*loss_map, cmap="grey", aspect="auto")
         fig.colorbar(pic, ax=axes, orientation="horizontal", fraction=0.05, pad=0.1)
+        means = jnp.array([jnp.mean(m) for m in loss_maps])
+        stds = jnp.array([jnp.std(m) for m in loss_maps])
+        print(f'means: \n{means}\n\n stds:\n{stds}')
         plt.show()
     def _reshape_frames(self, frames:Array, smoothing_params:dict=None)->Array:
         """Reorganizes random particle samples into a sequence of images.
@@ -534,18 +600,25 @@ class image_sampler:
             Array: Array of images.
         """
         n, _, _ = frames.shape
-        output_array = jnp.ones((n, self.xmax, self.ymax, 3))
+        output_array = jnp.zeros((n, self.xmax, self.ymax, 3))
         
         # Iterate over the batch dimension
         for i in range(n):
             indices = frames[i, :, :2].astype(int)
             values = frames[i, :, 2:]
-            output_array = output_array.at[i, indices[:, 0], indices[:, 1]].set(values)
+            output_array = output_array.at[i, indices[:, 0], indices[:, 1]].add(values)
+            index_counts = jnp.zeros_like(output_array[i])
+            index_counts = index_counts.at[indices[:, 0], indices[:, 1]].add(1.)
+            whites = jnp.all(index_counts == 0, axis=-1)
+            index_counts = jnp.clip(index_counts, 1.,)
+            output_array = output_array.at[i, :, :].set(output_array[i] / index_counts)
+            output_array = output_array.at[i].add(whites[:,:,None].astype(jnp.float32))
             if smoothing_params:
                 in_oklab = vmap(vmap(linear_srgb_to_oklab))(output_array[i])
                 smoothed_oklab = gaussian_smooth(in_oklab, **smoothing_params)
                 smoothed_rgb = jnp.clip (vmap(vmap(oklab_to_linear_srgb))(smoothed_oklab) , 0., 1.)
-                output_array = output_array.at[i].set(smoothed_rgb)
+                whered_image = jnp.where(whites[:,:, None], smoothed_rgb, output_array[i])
+                output_array = output_array.at[i].set(whered_image)
         return output_array
 
     def draw_gif(self, gif_loc: str = None, start_frame:int=0,interval: int = 50, render:Literal['scatter', 'pixel']='pixel', smoothing_params:dict=None) -> FuncAnimation:
