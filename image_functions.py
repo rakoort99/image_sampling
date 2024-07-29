@@ -265,7 +265,7 @@ def posterize_image(
     if (curr_space == "oklab") & (output_space == "rgb"):
         posterized_img = vmap(vmap(oklab_to_linear_srgb))(posterized_img)
         curr_space = "rgb"
-    return posterized_img
+    return jnp.array(posterized_img)
 
 
 def gaussian_smooth(
@@ -330,7 +330,6 @@ class image_sampler:
         loss_space: Literal["rgb", "oklab"] = "rgb",
         likelihood_params: dict = {"INF":1e2, 'scaled':True, 'box_bounds':(-5., 5.)},
         posterization_params: dict = {"posterizer": "rgb", "n_colors": 9},
-        smoother_params: dict = {"kernel_size": 1, "kernel_std": 1.},
         sampler_params: dict = {
             "annealing_steps": 50,
             "lambd_range": (-1., 2.),
@@ -345,7 +344,6 @@ class image_sampler:
             loss_space (Literal[&#39;rgb&#39;, &#39;oklab&#39;], optional): Color space to calculate loss function. Defaults to "rgb".
             likelihood_params (dict, optional): Parameters for likelihood function. Defaults to {"dist_mod": lambda x: (9 * x) ** 2}.
             posterization_params (dict, optional): Parameters for posterization function. Defaults to {"posterizer": "rgb", "n_colors": 9}.
-            smoother_params (dict, optional): Parameters for smoothing function. Defaults to {"kernel_size":9, "kernel_std": 1.0}.
             sampler_params (dict, optional): Parameters for sampling function. Defaults to { "annealing_steps": 125, "lambd_range": (-3, -0.5), "extra_steps": 25, }.
         """
         self.img = img
@@ -356,7 +354,6 @@ class image_sampler:
 
         self.likelihood_params = likelihood_params
         self.posterization_params = posterization_params
-        self.smoother_params = smoother_params
         self.sampler_params = sampler_params
         self.prior_logpdf = lambda x: 0
 
@@ -372,8 +369,8 @@ class image_sampler:
         """
         # items stored as class objects to make their retreival easier
         key1, key2, key3 = jr.split(key, 3)
-        # generate posterized palette
-        self.palette = posterize_image(
+        # generate posterized reference image
+        self.ref_img = posterize_image(
             img=self.img,
             key=key1,
             output_space=self.loss_space,
@@ -382,8 +379,6 @@ class image_sampler:
         z_init = self._initialize_samps(
             self.num_particles, key2
         )  # initialize particles
-        # create reference image for loss function
-        self.ref_img = gaussian_smooth(image=self.palette, **self.smoother_params)
         # create loss function from reference image
         self._log_likelihood = self._gen_likelihood_function(**self.likelihood_params)  
         frames = self._sample_tempered_hmc(z_init, key3)[0]  # samples particle movement
@@ -401,8 +396,7 @@ class image_sampler:
         key1, key2 = jr.split(key, 2)
         max_vals = jnp.array([self.xmax, self.ymax], dtype=jnp.int32)
         coords_init = jr.randint(key1, (n_particles, 2), minval=0, maxval=max_vals)
-
-        pixel_bucket = jnp.reshape(self.palette, (-1, 3))
+        pixel_bucket = jnp.reshape(self.ref_img, (-1, 3))
         unique_colors, counts = jnp.unique(pixel_bucket, axis=0, return_counts=True)
 
         # white is blank space when plotting, so omit from color space
@@ -463,13 +457,14 @@ class image_sampler:
             loss_maps = bcd          
             means = jnp.mean(bcd, axis=(1,2))
             stds = jnp.std(bcd, axis=(1,2))
-            def find_index(value):
-                match = jnp.all(uq_colors == value, axis=1)
-                return jnp.argmax(match)
             @jit
             def log_likelihood(z):
                 def distance(x, y):
                     return jnp.sqrt(jnp.sum((x - y) ** 2))
+                def find_index(value):
+                    # match = vmap(lambda x: distance(x, uq_colors))(value)
+                    match = jnp.all(uq_colors == value, axis=1)
+                    return jnp.argmax(match)
                 coords = z[:2]
                 colors = z[2:]
                 floor_z = jnp.floor(coords)
@@ -512,6 +507,7 @@ class image_sampler:
                 i, state, key = carry
                 key = jr.fold_in(key, i)
                 state, _ = smc_kernel(key, state, lambd)
+                # state = blackjax.smc.tempered.TemperedSMCState(state.particles.at[:,2:].set(init[:,2:]), state.weights, state.lmbda)
                 return (i + 1, state, key), state
 
             n_iter, final_state = lax.scan(
@@ -552,7 +548,7 @@ class image_sampler:
 
     def _gen_loss_maps(self, log_likelihood_fn):
         # get unique color values
-        colors = self.palette
+        colors = self.ref_img
         colors = jnp.reshape(colors, (-1, 3))
         colors, invs = jnp.unique(colors, axis=0, return_inverse=True)
 
