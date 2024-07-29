@@ -15,6 +15,7 @@ from typing import Literal
 from jaxopt import ProjectedGradient
 from jaxopt.projection import projection_box
 from matplotlib.animation import FuncAnimation
+from blackjax.smc.tempered import TemperedSMCState
 
 # functions to translate RGB to OKLAB and back
 
@@ -322,13 +323,30 @@ def opt_boxcox(x, box_bounds):
     lambd = res.params
     return boxcox(lambd, x), lambd
 
+def inv_truncnorm(x):
+    a = -6.5
+    b =-0.5
+    mu = -3.5
+    sig = 1.
+    cdf = jsp.stats.norm.cdf
+    ppf = jsp.stats.norm.ppf
+    return ppf( cdf((a-mu)/sig ) + x * (cdf((b-mu)/sig ) - cdf((a-mu)/sig ) ) )*sig + mu
+     
+@jit
+def blom(x):
+    ranks = jsp.stats.rankdata(x, method='average')
+    blommed = inv_truncnorm((ranks - 3/8)/(len(ranks)+1/4))
+    design = jnp.column_stack([jnp.ones_like(x), x, x**2, x**3, jnp.exp(x), jnp.sin(x), jnp.cos(x)])
+    beta = jnp.linalg.inv(design.T @ design) @ design.T @ blommed
+    return blommed, beta
+
 class image_sampler:
     def __init__(
         self,
         img: Array,
         num_particles: int = 50000,
         loss_space: Literal["rgb", "oklab"] = "rgb",
-        likelihood_params: dict = {"INF":1e2, 'scaled':True, 'box_bounds':(-5., 5.)},
+        likelihood_params: dict = {"INF":1e2, 'scaled':True},
         posterization_params: dict = {"posterizer": "rgb", "n_colors": 9},
         smoother_params: dict = {"kernel_size": 1, "kernel_std": 1.},
         sampler_params: dict = {
@@ -385,8 +403,9 @@ class image_sampler:
         # create reference image for loss function
         self.ref_img = gaussian_smooth(image=self.palette, **self.smoother_params)
         # create loss function from reference image
-        self._log_likelihood = self._gen_likelihood_function(**self.likelihood_params)  
-        frames = self._sample_tempered_hmc(z_init, key3)[0]  # samples particle movement
+        self._log_likelihood = self._gen_likelihood_function(**self.likelihood_params)
+        self.samples_out = self._sample_tempered_hmc(z_init, key3)  
+        frames = self.samples_out[0]  # samples particle movement
         # convert to RGB if working in OKLAB space
         if self.loss_space.lower() == "oklab":
             frames = frames.at[:, :, 2:].set(
@@ -428,7 +447,7 @@ class image_sampler:
         z_init = jnp.concat([coords_init, colors], axis=-1)
         return z_init
 
-    def _gen_likelihood_function(self, INF=1e2, scaled=True, box_bounds=(-5.,5.)):
+    def _gen_likelihood_function(self, INF=1e2, scaled=True):
         @jit
         def log_likelihood(z):
             def distance(x, y):
@@ -456,20 +475,17 @@ class image_sampler:
         
         if scaled:
             loss_maps, (uq_colors, invs) = self._gen_loss_maps(log_likelihood)
-            mins = jnp.min( loss_maps, axis=(1,2))
-            offset = 1.1
-            bcd, lambds = vmap(lambda x, mins, offset: opt_boxcox(x - mins + offset, box_bounds), 
-                               (0,0,None))(loss_maps, mins, offset)
-            loss_maps = bcd          
-            means = jnp.mean(bcd, axis=(1,2))
-            stds = jnp.std(bcd, axis=(1,2))
-            def find_index(value):
-                match = jnp.all(uq_colors == value, axis=1)
-                return jnp.argmax(match)
+            uq_losses = jnp.unique(loss_maps.reshape((loss_maps.shape[0], -1)), axis=1)
+            blommed, betas = vmap(blom)(uq_losses)
+            sigs = jnp.std(blommed, -1)
+
             @jit
             def log_likelihood(z):
                 def distance(x, y):
                     return jnp.sqrt(jnp.sum((x - y) ** 2))
+                def find_index(value):
+                    match = vmap(lambda x: distance(x,value))(uq_colors)#jnp.all(uq_colors == value, axis=1)
+                    return jnp.argmin(match)
                 coords = z[:2]
                 colors = z[2:]
                 floor_z = jnp.floor(coords)
@@ -484,11 +500,12 @@ class image_sampler:
                 )
                 idx = find_index(colors)
                 dist = -1*distance(self.ref_img[floor_z[0], floor_z[1]], colors)
-                bcd = boxcox(lambds[idx], dist - mins[idx]+offset)
+                design = jnp.column_stack([jnp.ones_like(dist), dist, dist**2, dist**3, jnp.exp(dist), jnp.sin(dist), jnp.cos(dist)]).squeeze()
+                blommed_dist = design @ betas[idx]
                 value = lax.cond(
                     out_of_bounds,
                     lambda *_: -INF,
-                    lambda *_: (bcd - means[idx])/stds[idx],
+                    lambda *_: blommed_dist, #/ sigs[idx],
                     operand=floor_z,
                 )
                 return value
@@ -512,6 +529,9 @@ class image_sampler:
                 i, state, key = carry
                 key = jr.fold_in(key, i)
                 state, _ = smc_kernel(key, state, lambd)
+                new_particles = state.particles
+                new_particles = new_particles.at[:, 2:].set(init[:, 2:])
+                state = TemperedSMCState(new_particles, state.weights, state.lmbda)
                 return (i + 1, state, key), state
 
             n_iter, final_state = lax.scan(
@@ -524,7 +544,7 @@ class image_sampler:
             jnp.array([2, 2, 1e-9, 1e-9, 1e-9])
         )  # really small values effectively freeze momentum
         hmc_parameters = dict(
-            step_size=1.0, inverse_mass_matrix=inv_mass_matrix, num_integration_steps=1
+            step_size=1., inverse_mass_matrix=inv_mass_matrix, num_integration_steps=1
         )
 
         schedule_tempered = blackjax.tempered_smc(
@@ -587,7 +607,12 @@ class image_sampler:
         fig.colorbar(pic, ax=axes, orientation="horizontal", fraction=0.05, pad=0.1)
         means = jnp.array([jnp.mean(m) for m in loss_maps])
         stds = jnp.array([jnp.std(m) for m in loss_maps])
-        print(f'means: \n{means}\n\n stds:\n{stds}')
+        mins = jnp.array([jnp.min(m) for m in loss_maps])
+        maxs = jnp.array([jnp.max(m) for m in loss_maps])
+        print(f'means:\n{means}\nstds:\n{stds}')
+        print()
+        print(f'mins:\n{mins}\nmaxs:\n{maxs}')
+
         plt.show()
     def _reshape_frames(self, frames:Array, smoothing_params:dict=None)->Array:
         """Reorganizes random particle samples into a sequence of images.
